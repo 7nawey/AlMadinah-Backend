@@ -1,4 +1,4 @@
-﻿using AutoMapper;
+using AutoMapper;
 using AlMadina.Domain.Entities;
 using AlMadina.Application.DTOs;
 
@@ -18,7 +18,8 @@ public class MappingProfile : Profile
         // Product
         CreateMap<Product, ProductDto>()
             .ForMember(d => d.CategoryName,
-                o => o.MapFrom(s => s.Category != null ? s.Category.NameEn : null));
+                o => o.MapFrom(s => s.Category != null ? s.Category.NameEn : null))
+            .ForMember(d => d.FinalPrice, o => o.Ignore()); // computed per-request in ProductService
 
         CreateMap<CreateProductDto, Product>()
             .ForMember(d => d.ImageUrl, o => o.Ignore());
@@ -38,5 +39,9 @@ public class MappingProfile : Profile
         // Stock
         CreateMap<StockMovement, StockMovementDto>();
         CreateMap<CreateStockMovementDto, StockMovement>();
+
+        // Returns
+        CreateMap<ReturnRequest, ReturnRequestDto>();
+        CreateMap<ReturnItem, ReturnItemDto>();
     }
 }

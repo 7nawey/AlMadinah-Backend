@@ -1,4 +1,6 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using AlMadina.Application.Common;
 using AlMadina.Application.DTOs;
 using AlMadina.Application.Interfaces.Services;
 
@@ -6,91 +8,90 @@ namespace AlMadina.API.Controllers
 {
     [ApiController]
     [Route("api/auth")]
+    [Produces("application/json")]
     public class AuthController : ControllerBase
     {
         private readonly IAuthService _authService;
+        private readonly ILogger<AuthController> _logger;
 
-        public AuthController(
-            IAuthService authService)
+        public AuthController(IAuthService authService, ILogger<AuthController> logger)
         {
             _authService = authService;
+            _logger = logger;
         }
 
         [HttpPost("register")]
+        [AllowAnonymous]
         public async Task<IActionResult> Register([FromBody] RegisterUserDto dto)
         {
+            if (!ModelState.IsValid)
+                return BadRequest(ApiResponse<object>.Fail("Invalid request data"));
+
             var result = await _authService.RegisterAsync(dto);
-            return Ok(new { token = result });
+            return Ok(ApiResponse<object>.Ok(new { token = result }, "Registration successful"));
         }
 
         [HttpPost("login")]
+        [AllowAnonymous]
         public async Task<IActionResult> Login([FromBody] LoginUserDto dto)
         {
+            if (!ModelState.IsValid)
+                return BadRequest(ApiResponse<object>.Fail("Invalid request data"));
+
             var result = await _authService.LoginAsync(dto);
             if (result == null)
-                return Unauthorized(new { message = "Invalid credentials" });
-            return Ok(new { token = result });
+                return Unauthorized(ApiResponse<object>.Fail("Invalid credentials"));
+
+            return Ok(ApiResponse<object>.Ok(new { token = result }, "Login successful"));
         }
 
         [HttpPost("send-otp")]
-        public async Task<IActionResult> SendOtp(
-            SendOtpDto dto)
+        [AllowAnonymous]
+        public async Task<IActionResult> SendOtp([FromBody] SendOtpDto dto)
         {
             await _authService.SendOtpAsync(dto.Email);
-
-            return Ok("OTP sent");
+            return Ok(ApiResponse<object>.Ok(null!, "OTP sent successfully"));
         }
 
         [HttpPost("verify-otp")]
-        public async Task<IActionResult> VerifyOtp(
-            VerifyOtpDto dto)
+        [AllowAnonymous]
+        public async Task<IActionResult> VerifyOtp([FromBody] VerifyOtpDto dto)
         {
-            var result =
-                await _authService.VerifyOtpAsync(dto);
-
+            var result = await _authService.VerifyOtpAsync(dto);
             if (result == null)
-                return BadRequest("Invalid OTP");
+                return BadRequest(ApiResponse<object>.Fail("Invalid OTP"));
 
-            return Ok(result);
+            return Ok(ApiResponse<object>.Ok(result, "OTP verified"));
         }
 
         [HttpPost("google-login")]
-        public async Task<IActionResult> GoogleLogin(
-            GoogleLoginDto dto)
+        [AllowAnonymous]
+        public async Task<IActionResult> GoogleLogin([FromBody] GoogleLoginDto dto)
         {
-            var result =
-                await _authService
-                .GoogleLoginAsync(dto.IdToken);
-
-            return Ok(result);
+            var result = await _authService.GoogleLoginAsync(dto.IdToken);
+            return Ok(ApiResponse<object>.Ok(result, "Google login successful"));
         }
 
         [HttpGet("profile/{id}")]
-        public async Task<IActionResult> Profile(
-            string id)
+        [Authorize]
+        public async Task<IActionResult> Profile(string id)
         {
-            var user =
-                await _authService
-                .GetProfileAsync(id);
-
+            var user = await _authService.GetProfileAsync(id);
             if (user == null)
-                return NotFound();
+                return NotFound(ApiResponse<object>.Fail("User not found"));
 
-            return Ok(user);
+            return Ok(ApiResponse<object>.Ok(user));
         }
 
-        [HttpPut("update")]
-        public async Task<IActionResult> Update(
-            UpdateUserDto dto)
+        [HttpPut("profile")]
+        [Authorize]
+        public async Task<IActionResult> Update([FromBody] UpdateUserDto dto)
         {
-            var result =
-                await _authService
-                .UpdateUserAsync(dto);
-
+            var result = await _authService.UpdateUserAsync(dto);
             if (!result)
-                return NotFound();
+                return NotFound(ApiResponse<object>.Fail("User not found"));
 
-            return Ok();
+            return Ok(ApiResponse<object>.Ok(null!, "Profile updated"));
         }
     }
 }

@@ -1,198 +1,113 @@
+using System.Security.Claims;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.EntityFrameworkCore;
+using AlMadina.Application.Common;
 using AlMadina.Application.DTOs;
-using AlMadina.Application.Interfaces;
-using AlMadina.Domain.Entities;
+using AlMadina.Application.Interfaces.Services;
 
 namespace AlMadina.API.Controllers
 {
     [ApiController]
     [Route("api/orders")]
     [Produces("application/json")]
+    [Authorize]
     public class OrderController : ControllerBase
     {
-        private readonly IUnitOfWork _unitOfWork;
+        private readonly IOrderService _orderService;
+        private readonly ILogger<OrderController> _logger;
 
-        public OrderController(IUnitOfWork unitOfWork)
+        public OrderController(IOrderService orderService, ILogger<OrderController> logger)
         {
-            _unitOfWork = unitOfWork;
+            _orderService = orderService;
+            _logger = logger;
         }
 
-        // ================== CREATE ORDER ==================
-        [HttpPost("create")]
-        public async Task<IActionResult> CreateOrder([FromBody] CreateOrderDto dto)
+        private string UserId => User.FindFirstValue(ClaimTypes.NameIdentifier) ?? string.Empty;
+        private bool IsAdmin => User.IsInRole("Admin");
+
+        [HttpPost]
+        public async Task<IActionResult> Create([FromBody] CreateOrderDto dto)
         {
-            var order = new Order
+            _logger.LogInformation("User {UserId} creating order", UserId);
+            var result = await _orderService.CreateAsync(dto, UserId);
+            return Ok(ApiResponse<OrderResultDto>.Ok(result, "Order created successfully"));
+        }
+
+        [HttpPost("in-store")]
+        [Authorize(Roles = "Admin")]
+        public async Task<IActionResult> CreateInStore([FromBody] CreateInStoreOrderDto dto)
+        {
+            var result = await _orderService.CreateInStoreAsync(dto, UserId);
+            return Ok(ApiResponse<OrderResultDto>.Ok(result, "In-store order created successfully"));
+        }
+
+        [HttpGet]
+        public async Task<IActionResult> GetAll([FromQuery] PagedRequest? paging = null)
+        {
+            if (IsAdmin)
             {
-                Id = Guid.NewGuid(),
-                UserId = dto.UserId,
-                CustomerPhone = dto.CustomerPhone,
-                CustomerAddress = dto.CustomerAddress,
-                Notes = dto.Notes,
-                DeliveryFee = dto.DeliveryFee,
-                Status = OrderStatus.Pending,
-                IsPaid = false,
-                CreatedAt = DateTime.UtcNow
-            };
-
-            decimal total = 0;
-            foreach (var item in dto.Items)
-            {
-                var product = await _unitOfWork.Products.GetByIdAsync(item.ProductId);
-                if (product == null)
-                    return BadRequest($"Product {item.ProductId} not found");
-
-                var unitPrice = product.Price;
-                // apply discount if active
-                if (product.DiscountPercentage.HasValue && product.DiscountPercentage > 0)
-                {
-                    unitPrice = product.Price * (1 - product.DiscountPercentage.Value / 100m);
-                }
-
-                var orderItem = new OrderItem
-                {
-                    Id = Guid.NewGuid(),
-                    OrderId = order.Id,
-                    ProductId = item.ProductId,
-                    Quantity = item.Quantity,
-                    UnitPrice = unitPrice,
-                    TotalPrice = unitPrice * item.Quantity
-                };
-
-                total += orderItem.TotalPrice;
-                order.Items.Add(orderItem);
-
-                // decrease stock
-                product.StockQuantity -= item.Quantity;
-                _unitOfWork.Products.Update(product);
+                var orders = await _orderService.GetAllAsync();
+                return Ok(ApiResponse<IEnumerable<OrderDto>>.Ok(orders, "Orders retrieved", orders.Count()));
             }
 
-            order.TotalPrice = total + order.DeliveryFee;
-
-            await _unitOfWork.Orders.AddAsync(order);
-            await _unitOfWork.SaveChangesAsync();
-
-            return Ok(new { orderId = order.Id, total = order.TotalPrice, status = order.Status });
+            var myOrders = await _orderService.GetByUserIdAsync(UserId);
+            return Ok(ApiResponse<IEnumerable<OrderDto>>.Ok(myOrders, "Your orders retrieved", myOrders.Count()));
         }
 
-        // ================== GET ALL ORDERS ==================
-        [HttpGet("all")]
-        public async Task<IActionResult> GetAllOrders()
-        {
-            var orders = await _unitOfWork.Orders
-                .GetAllQueryable()
-                .Include(o => o.Items)
-                .ThenInclude(i => i.Product)
-                .OrderByDescending(o => o.CreatedAt)
-                .ToListAsync();
-
-            return Ok(MapOrders(orders));
-        }
-
-        // ================== GET MY ORDERS ==================
         [HttpGet("my")]
-        public async Task<IActionResult> GetMyOrders([FromQuery] string userId)
+        public async Task<IActionResult> GetMyOrders()
         {
-            var orders = await _unitOfWork.Orders
-                .GetAllQueryable()
-                .Include(o => o.Items)
-                .ThenInclude(i => i.Product)
-                .Where(o => o.UserId == userId)
-                .OrderByDescending(o => o.CreatedAt)
-                .ToListAsync();
-
-            return Ok(MapOrders(orders));
+            var orders = await _orderService.GetByUserIdAsync(UserId);
+            return Ok(ApiResponse<IEnumerable<OrderDto>>.Ok(orders, "Your orders retrieved", orders.Count()));
         }
 
-        // ================== GET ORDER BY ID ==================
-        [HttpGet("{id}")]
-        public async Task<IActionResult> GetOrder(Guid id)
+        [HttpGet("{id:guid}")]
+        public async Task<IActionResult> GetById(Guid id)
         {
-            var order = await _unitOfWork.Orders
-                .GetAllQueryable()
-                .Include(o => o.Items)
-                .ThenInclude(i => i.Product)
-                .FirstOrDefaultAsync(o => o.Id == id);
-
+            var order = await _orderService.GetByIdAsync(id);
             if (order == null)
-                return NotFound();
+                return NotFound(ApiResponse<object>.Fail("Order not found"));
 
-            return Ok(MapOrder(order));
-        }
-
-        // ================== UPDATE STATUS / PAYMENT ==================
-        [HttpPut("update-status")]
-        public async Task<IActionResult> UpdateStatus([FromBody] UpdateOrderStatusDto dto)
-        {
-            var order = await _unitOfWork.Orders.GetByIdAsync(dto.OrderId);
-            if (order == null)
-                return NotFound();
-
-            order.Status = dto.Status;
-            order.IsPaid = dto.IsPaid;
-            _unitOfWork.Orders.Update(order);
-            await _unitOfWork.SaveChangesAsync();
-
-            return Ok("Updated");
-        }
-
-        // ================== DELETE ORDER ==================
-        [HttpDelete("{id}")]
-        public async Task<IActionResult> DeleteOrder(Guid id)
-        {
-            var order = await _unitOfWork.Orders.GetByIdAsync(id);
-            if (order == null)
-                return NotFound();
-
-            // restore stock
-            var items = await _unitOfWork.OrderItems
-                .GetAllQueryable()
-                .Where(i => i.OrderId == id)
-                .ToListAsync();
-
-            foreach (var item in items)
+            if (!IsAdmin && order.UserId != UserId)
             {
-                var product = await _unitOfWork.Products.GetByIdAsync(item.ProductId);
-                if (product != null)
-                {
-                    product.StockQuantity += item.Quantity;
-                    _unitOfWork.Products.Update(product);
-                }
+                _logger.LogWarning("User {UserId} attempted to access order {OrderId} belonging to {OwnerId}", UserId, id, order.UserId);
+                return Forbid();
             }
 
-            _unitOfWork.Orders.Delete(order);
-            await _unitOfWork.SaveChangesAsync();
-            return Ok("Deleted");
+            return Ok(ApiResponse<OrderDto>.Ok(order));
         }
 
-        private static List<OrderDto> MapOrders(List<Order> orders)
+        [HttpPut("{id:guid}/status")]
+        [Authorize(Roles = "Admin")]
+        public async Task<IActionResult> UpdateStatus(Guid id, [FromBody] UpdateOrderStatusDto dto)
         {
-            return orders.Select(MapOrder).ToList();
+            dto.OrderId = id;
+            var result = await _orderService.UpdateStatusAsync(dto);
+            if (!result)
+                return NotFound(ApiResponse<object>.Fail("Order not found"));
+
+            return Ok(ApiResponse<object>.Ok(null!, "Order status updated"));
         }
 
-        private static OrderDto MapOrder(Order order)
+        [HttpPost("{id:guid}/cancel")]
+        public async Task<IActionResult> Cancel(Guid id)
         {
-            return new OrderDto
-            {
-                Id = order.Id,
-                UserId = order.UserId,
-                CreatedAt = order.CreatedAt,
-                TotalPrice = order.TotalPrice,
-                Status = order.Status,
-                CustomerPhone = order.CustomerPhone,
-                CustomerAddress = order.CustomerAddress,
-                Notes = order.Notes,
-                DeliveryFee = order.DeliveryFee,
-                IsPaid = order.IsPaid,
-                Items = order.Items?.Select(i => new OrderItemDto
-                {
-                    ProductId = i.ProductId,
-                    ProductName = i.Product?.NameAr ?? "",
-                    Quantity = i.Quantity,
-                    UnitPrice = i.UnitPrice,
-                    TotalPrice = i.TotalPrice
-                }).ToList() ?? new List<OrderItemDto>()
-            };
+            var result = await _orderService.CancelAsync(id, UserId, IsAdmin);
+            if (!result)
+                return NotFound(ApiResponse<object>.Fail("Order not found"));
+
+            return Ok(ApiResponse<object>.Ok(null!, "Order cancelled"));
+        }
+
+        [HttpDelete("{id:guid}")]
+        [Authorize(Roles = "Admin")]
+        public async Task<IActionResult> Delete(Guid id)
+        {
+            var result = await _orderService.DeleteAsync(id);
+            if (!result)
+                return NotFound(ApiResponse<object>.Fail("Order not found"));
+
+            return Ok(ApiResponse<object>.Ok(null!, "Order deleted"));
         }
     }
 }

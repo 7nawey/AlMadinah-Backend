@@ -1,5 +1,7 @@
-﻿using AutoMapper;
+using AutoMapper;
+using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
+using AlMadina.Application.Common;
 using AlMadina.Application.DTOs;
 using AlMadina.Application.Interfaces;
 using AlMadina.Application.Interfaces.Services;
@@ -29,7 +31,8 @@ namespace AlMadina.Infrastructure.Services
             var query = _unitOfWork.Products
                 .GetAllQueryable()
                 .Include(x => x.Category)
-                .OrderByDescending(x => x.CreatedAt);
+                .OrderBy(x => x.DisplayOrder)
+                .ThenByDescending(x => x.CreatedAt);
 
             var totalCount = await query.CountAsync();
 
@@ -43,30 +46,116 @@ namespace AlMadina.Infrastructure.Services
                 PageNumber = pageNumber,
                 PageSize = pageSize,
                 TotalCount = totalCount,
-                Data = _mapper.Map<List<ProductDto>>(products)
+                Data = await MapWithPricingAsync(products)
             };
         }
 
         // ================= SEARCH (PRODUCT + CATEGORY + BARCODE) =================
-        public async Task<IEnumerable<ProductDto>> SearchAsync(string keyword)
+        public async Task<PagedResult<ProductDto>> SearchAsync(string keyword, int pageNumber = 1, int pageSize = 20)
         {
             keyword = keyword?.Trim() ?? "";
 
-            var products = await _unitOfWork.Products
-                .GetAllQueryable()
-                .Include(x => x.Category)
-                .Where(x =>
-                    x.NameAr.Contains(keyword) ||
-                    x.NameEn.Contains(keyword) ||
-                    (x.Barcode != null && x.Barcode.Contains(keyword)) ||
-                    (x.Category != null &&
-                     (x.Category.NameAr.Contains(keyword) ||
-                      x.Category.NameEn.Contains(keyword)))
-                )
-                .OrderByDescending(x => x.CreatedAt)
-                .ToListAsync();
+            if (keyword.Length == 0)
+            {
+                return new PagedResult<ProductDto>
+                {
+                    PageNumber = pageNumber,
+                    PageSize = pageSize,
+                    TotalCount = 0,
+                    Data = new List<ProductDto>()
+                };
+            }
 
-            return _mapper.Map<List<ProductDto>>(products);
+            // Arabic-normalized form of the keyword matches the
+            // pre-normalized NameArNormalized column (أ/إ/آ→ا, ة→ه, ى→ي,
+            // diacritics stripped), so "الألبان" finds "الالبان" and vice versa.
+            var normalizedKeyword = ArabicTextNormalizer.Normalize(keyword) ?? keyword.ToLowerInvariant();
+
+            // Split into tokens so near / partially-typed names still match
+            // ("جبنه رومي" finds "جبنة رومي قديم", word order does not matter).
+            var tokens = normalizedKeyword
+                .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Distinct()
+                .ToArray();
+
+            var baseQuery = _unitOfWork.Products
+                .GetAllQueryable()
+                .Include(x => x.Category);
+
+            // Full-keyword match (original behavior)
+            IQueryable<Product> query = baseQuery.Where(x =>
+                x.NameAr.Contains(keyword) ||
+                (x.NameArNormalized != null && x.NameArNormalized.Contains(normalizedKeyword)) ||
+                x.NameEn.Contains(keyword) ||
+                (x.Barcode != null && x.Barcode.Contains(keyword)) ||
+                (x.Category != null &&
+                 (x.Category.NameAr.Contains(keyword) ||
+                  x.Category.NameEn.Contains(keyword)))
+            );
+
+            // Broaden with per-token matching so near names are found too
+            foreach (var token in tokens)
+            {
+                if (token == normalizedKeyword) continue;
+                var t = token;
+                query = query.Union(baseQuery.Where(x =>
+                    x.NameAr.Contains(t) ||
+                    (x.NameArNormalized != null && x.NameArNormalized.Contains(t)) ||
+                    x.NameEn.Contains(t)));
+            }
+
+            var candidates = await query.ToListAsync();
+
+            // Rank by closeness to the keyword (nearest first):
+            // exact barcode > barcode prefix > exact name > name starts-with >
+            // name contains > all tokens matched > some tokens > category only.
+            var lowerKeyword = keyword.ToLowerInvariant();
+
+            int Score(Product x)
+            {
+                var nameNorm = x.NameArNormalized ?? ArabicTextNormalizer.Normalize(x.NameAr) ?? "";
+                var nameEn = (x.NameEn ?? "").ToLowerInvariant();
+
+                if (x.Barcode != null && x.Barcode == keyword) return 1000;
+
+                var score = 0;
+                if (x.Barcode != null && x.Barcode.StartsWith(keyword)) score = Math.Max(score, 500);
+                if (nameNorm == normalizedKeyword || nameEn == lowerKeyword) score = Math.Max(score, 400);
+                if (nameNorm.StartsWith(normalizedKeyword) || nameEn.StartsWith(lowerKeyword)) score = Math.Max(score, 300);
+                if (x.NameAr.Contains(keyword) || nameNorm.Contains(normalizedKeyword) || nameEn.Contains(lowerKeyword))
+                    score = Math.Max(score, 250);
+
+                var matchedTokens = tokens.Count(t => nameNorm.Contains(t) || nameEn.Contains(t));
+                if (matchedTokens == tokens.Length) score = Math.Max(score, 200);
+                else if (matchedTokens > 0) score = Math.Max(score, 100 + matchedTokens * 20);
+
+                if (x.Category != null &&
+                    (x.Category.NameAr.Contains(keyword) || x.Category.NameEn.Contains(keyword)))
+                    score = Math.Max(score, 50);
+
+                return score;
+            }
+
+            var ordered = candidates
+                .OrderByDescending(Score)
+                .ThenBy(x => x.DisplayOrder)
+                .ThenByDescending(x => x.CreatedAt)
+                .ToList();
+
+            var totalCount = ordered.Count;
+
+            var products = ordered
+                .Skip((pageNumber - 1) * pageSize)
+                .Take(pageSize)
+                .ToList();
+
+            return new PagedResult<ProductDto>
+            {
+                PageNumber = pageNumber,
+                PageSize = pageSize,
+                TotalCount = totalCount,
+                Data = await MapWithPricingAsync(products)
+            };
         }
 
         // ================= GET BY ID =================
@@ -77,7 +166,10 @@ namespace AlMadina.Infrastructure.Services
                 .Include(x => x.Category)
                 .FirstOrDefaultAsync(x => x.Id == id);
 
-            return product == null ? null : _mapper.Map<ProductDto>(product);
+            if (product == null) return null;
+
+            var dto = await MapWithPricingAsync(new List<Product> { product });
+            return dto.First();
         }
 
         // ================= GET FOR UPDATE (SEARCH BY NAME OR BARCODE) =================
@@ -93,63 +185,159 @@ namespace AlMadina.Infrastructure.Services
                     x.NameEn == value ||
                     x.Barcode == value);
 
-            return product == null ? null : _mapper.Map<ProductDto>(product);
+            if (product == null) return null;
+
+            var dto = await MapWithPricingAsync(new List<Product> { product });
+            return dto.First();
         }
 
         // ================= FEATURED =================
-        public async Task<IEnumerable<ProductDto>> GetFeaturedAsync()
+        public async Task<PagedResult<ProductDto>> GetFeaturedAsync(int pageNumber = 1, int pageSize = 20)
         {
-            var products = await _unitOfWork.Products
+            var query = _unitOfWork.Products
                 .GetAllQueryable()
                 .Include(x => x.Category)
                 .Where(x => x.IsFeatured)
+                .OrderBy(x => x.DisplayOrder)
+                .ThenByDescending(x => x.CreatedAt);
+
+            var totalCount = await query.CountAsync();
+
+            var products = await query
+                .Skip((pageNumber - 1) * pageSize)
+                .Take(pageSize)
                 .ToListAsync();
 
-            return _mapper.Map<List<ProductDto>>(products);
+            return new PagedResult<ProductDto>
+            {
+                PageNumber = pageNumber,
+                PageSize = pageSize,
+                TotalCount = totalCount,
+                Data = await MapWithPricingAsync(products)
+            };
         }
 
-        // ================= DISCOUNTED =================
-        public async Task<IEnumerable<ProductDto>> GetDiscountedAsync()
+        // ================= DISCOUNTED (own discount columns OR an active deal) =================
+        public async Task<PagedResult<ProductDto>> GetDiscountedAsync(int pageNumber = 1, int pageSize = 20)
         {
-            var products = await _unitOfWork.Products
+            var now = DateTime.UtcNow;
+
+            var activeDeals = _unitOfWork.Deals
+                .GetAllQueryable()
+                .Where(d => d.IsActive
+                    && (d.StartDate == default || d.StartDate <= now)
+                    && (d.EndDate == default || d.EndDate >= now));
+
+            var query = _unitOfWork.Products
                 .GetAllQueryable()
                 .Include(x => x.Category)
-                .Where(x => x.DiscountPercentage > 0)
+                .Where(x => x.DiscountPercentage > 0
+                    || activeDeals.Any(d => d.ProductId == x.Id))
+                .OrderBy(x => x.DisplayOrder)
+                .ThenByDescending(x => x.CreatedAt);
+
+            var totalCount = await query.CountAsync();
+
+            var products = await query
+                .Skip((pageNumber - 1) * pageSize)
+                .Take(pageSize)
                 .ToListAsync();
 
-            return _mapper.Map<List<ProductDto>>(products);
+            return new PagedResult<ProductDto>
+            {
+                PageNumber = pageNumber,
+                PageSize = pageSize,
+                TotalCount = totalCount,
+                Data = await MapWithPricingAsync(products)
+            };
         }
 
         // ================= BEST SELLING (REAL SALES LOGIC) =================
-        public async Task<IEnumerable<ProductDto>> GetBestSellingAsync()
+        // Only counts items from actually paid/delivered orders —
+        // cancelled or unpaid orders must not inflate best-seller numbers.
+        public async Task<PagedResult<ProductDto>> GetBestSellingAsync(int pageNumber = 1, int pageSize = 20)
         {
-            var products = await _unitOfWork.Products
+            var query = _unitOfWork.Products
                 .GetAllQueryable()
                 .Include(x => x.Category)
-                .Include(x => x.OrderItems)
                 .Select(p => new
                 {
                     Product = p,
-                    SoldQty = p.OrderItems.Sum(o => o.Quantity)
+                    SoldQty = p.OrderItems
+                        .Where(o => o.Order.Status == OrderStatus.Paid ||
+                                    o.Order.Status == OrderStatus.Delivered)
+                        .Sum(o => (int?)o.Quantity) ?? 0
                 })
                 .OrderByDescending(x => x.SoldQty)
-                .Take(30)
+                .ThenBy(x => x.Product.DisplayOrder);
+
+            var totalCount = await query.CountAsync();
+
+            var products = await query
+                .Skip((pageNumber - 1) * pageSize)
+                .Take(pageSize)
                 .Select(x => x.Product)
                 .ToListAsync();
 
-            return _mapper.Map<List<ProductDto>>(products);
+            return new PagedResult<ProductDto>
+            {
+                PageNumber = pageNumber,
+                PageSize = pageSize,
+                TotalCount = totalCount,
+                Data = await MapWithPricingAsync(products)
+            };
         }
 
         // ================= OTHERS =================
-        public async Task<IEnumerable<ProductDto>> GetOthersAsync()
+        public async Task<PagedResult<ProductDto>> GetOthersAsync(int pageNumber = 1, int pageSize = 20)
         {
-            var products = await _unitOfWork.Products
+            var query = _unitOfWork.Products
                 .GetAllQueryable()
                 .Include(x => x.Category)
                 .Where(x => x.Category != null && x.Category.NameEn == "Others")
+                .OrderBy(x => x.DisplayOrder)
+                .ThenByDescending(x => x.CreatedAt);
+
+            var totalCount = await query.CountAsync();
+
+            var products = await query
+                .Skip((pageNumber - 1) * pageSize)
+                .Take(pageSize)
                 .ToListAsync();
 
-            return _mapper.Map<List<ProductDto>>(products);
+            return new PagedResult<ProductDto>
+            {
+                PageNumber = pageNumber,
+                PageSize = pageSize,
+                TotalCount = totalCount,
+                Data = await MapWithPricingAsync(products)
+            };
+        }
+
+        // ================= HOME REGULAR (non-featured, non-pinned) =================
+        public async Task<PagedResult<ProductDto>> GetHomeRegularProductsAsync(int pageNumber = 1, int pageSize = 20)
+        {
+            var query = _unitOfWork.Products
+                .GetAllQueryable()
+                .Include(x => x.Category)
+                .Where(x => !x.IsFeatured && !x.IsPinned)
+                .OrderBy(x => x.DisplayOrder)
+                .ThenByDescending(x => x.CreatedAt);
+
+            var totalCount = await query.CountAsync();
+
+            var products = await query
+                .Skip((pageNumber - 1) * pageSize)
+                .Take(pageSize)
+                .ToListAsync();
+
+            return new PagedResult<ProductDto>
+            {
+                PageNumber = pageNumber,
+                PageSize = pageSize,
+                TotalCount = totalCount,
+                Data = await MapWithPricingAsync(products)
+            };
         }
 
         // ================= CREATE =================
@@ -167,6 +355,7 @@ namespace AlMadina.Infrastructure.Services
                 Id = Guid.NewGuid(),
                 NameAr = dto.NameAr,
                 NameEn = string.IsNullOrWhiteSpace(dto.NameEn) ? dto.NameAr : dto.NameEn,
+                NameArNormalized = ArabicTextNormalizer.Normalize(dto.NameAr),
                 Barcode = dto.Barcode,
                 Price = dto.Price,
                 CostPrice = dto.CostPrice,
@@ -218,14 +407,14 @@ namespace AlMadina.Infrastructure.Services
         // ================= UPDATE =================
         public async Task<bool> UpdateAsync(UpdateProductDto dto)
         {
-            var product = await _unitOfWork.Products
-                .GetByIdAsync(dto.Id);
+            var product = await _unitOfWork.Products.GetByIdAsync(dto.Id);
 
             if (product == null)
                 return false;
 
             product.NameAr = dto.NameAr;
             product.NameEn = dto.NameEn;
+            product.NameArNormalized = ArabicTextNormalizer.Normalize(dto.NameAr);
             product.Barcode = dto.Barcode;
             product.Price = dto.Price;
             product.CostPrice = dto.CostPrice;
@@ -266,16 +455,19 @@ namespace AlMadina.Infrastructure.Services
 
             return true;
         }
+
+        // ================= GET BY CATEGORY =================
         public async Task<PagedResult<ProductDto>> GetProductsByCategoryAsync(
-    Guid categoryId,
-    int pageNumber = 1,
-    int pageSize = 40)
+            Guid categoryId,
+            int pageNumber = 1,
+            int pageSize = 40)
         {
             var query = _unitOfWork.Products
                 .GetAllQueryable()
                 .Include(x => x.Category)
                 .Where(x => x.CategoryId == categoryId)
-                .OrderByDescending(x => x.CreatedAt);
+                .OrderBy(x => x.DisplayOrder)
+                .ThenByDescending(x => x.CreatedAt);
 
             var totalCount = await query.CountAsync();
 
@@ -289,8 +481,71 @@ namespace AlMadina.Infrastructure.Services
                 PageNumber = pageNumber,
                 PageSize = pageSize,
                 TotalCount = totalCount,
-                Data = _mapper.Map<List<ProductDto>>(products)
+                Data = await MapWithPricingAsync(products)
             };
+        }
+
+        // ================= UPLOAD IMAGE =================
+        public async Task<string> UploadImageAsync(Guid id, IFormFile file)
+        {
+            var product = await _unitOfWork.Products.GetByIdAsync(id);
+            if (product == null)
+                throw new Exception("Product not found");
+
+            var imageUrl = await _fileService.UploadImageAsync(file);
+            product.ImageUrl = imageUrl;
+
+            _unitOfWork.Products.Update(product);
+            await _unitOfWork.SaveChangesAsync();
+
+            return imageUrl;
+        }
+
+        // ================= EFFECTIVE PRICING (active deal first, then product's own discount) =================
+        private async Task<List<ProductDto>> MapWithPricingAsync(List<Product> products)
+        {
+            var dtos = _mapper.Map<List<ProductDto>>(products);
+
+            var ids = products.Select(p => p.Id).ToList();
+            if (ids.Count == 0)
+                return dtos;
+
+            var now = DateTime.UtcNow;
+
+            var activeDeals = await _unitOfWork.Deals
+                .GetAllQueryable()
+                .Where(d => ids.Contains(d.ProductId)
+                    && d.IsActive
+                    && (d.StartDate == default || d.StartDate <= now)
+                    && (d.EndDate == default || d.EndDate >= now))
+                .ToListAsync();
+
+            var bestDealByProduct = activeDeals
+                .GroupBy(d => d.ProductId)
+                .ToDictionary(g => g.Key, g => g.OrderByDescending(d => d.DiscountPercentage ?? 0).First());
+
+            for (var i = 0; i < products.Count; i++)
+            {
+                var product = products[i];
+                var dto = dtos[i];
+
+                if (bestDealByProduct.TryGetValue(product.Id, out var deal))
+                {
+                    dto.FinalPrice = deal.DiscountedPrice;
+                    dto.DiscountPercentage = deal.DiscountPercentage
+                        ?? (product.Price > 0 ? Math.Round((1 - deal.DiscountedPrice / product.Price) * 100m, 2) : null);
+                }
+                else if (product.DiscountPercentage is > 0
+                    && product.DiscountStartDate.HasValue
+                    && product.DiscountEndDate.HasValue
+                    && now >= product.DiscountStartDate.Value
+                    && now <= product.DiscountEndDate.Value)
+                {
+                    dto.FinalPrice = Math.Round(product.Price * (1 - product.DiscountPercentage.Value / 100m), 2);
+                }
+            }
+
+            return dtos;
         }
     }
 }

@@ -1,7 +1,8 @@
-﻿using AlMadina.Application.DTOs;
+using AlMadina.Application.DTOs;
 using AlMadina.Application.Interfaces;
 using AlMadina.Domain.Entities;
 using AutoMapper;
+using Microsoft.EntityFrameworkCore;
 
 public class CategoryService : ICategoryService
 {
@@ -21,7 +22,10 @@ public class CategoryService : ICategoryService
 
     public async Task<IEnumerable<CategoryDto>> GetAllAsync()
     {
-        var categories = await _unitOfWork.Categories.GetAllAsync();
+        var categories = await _unitOfWork.Categories
+            .GetAllQueryable()
+            .OrderBy(x => x.DisplayOrder)
+            .ToListAsync();
         return _mapper.Map<IEnumerable<CategoryDto>>(categories);
     }
 

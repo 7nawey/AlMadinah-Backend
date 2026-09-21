@@ -1,4 +1,4 @@
-﻿using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http;
 
 namespace AlMadina.Application.DTOs
 {
@@ -25,6 +25,12 @@ namespace AlMadina.Application.DTOs
         public bool IsFeatured { get; set; }
 
         public decimal? DiscountPercentage { get; set; }
+
+        /// <summary>
+        /// Effective customer price after applying the active deal (or the product's own
+        /// date-bounded discount). Null when no active discount exists; use Price then.
+        /// </summary>
+        public decimal? FinalPrice { get; set; }
 
         public string? ImageUrl { get; set; }
 
